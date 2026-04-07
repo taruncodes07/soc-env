@@ -1,3 +1,14 @@
+---
+title: SOC-Env
+emoji: 🛡️
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+---
+
 # SOC-Env: Security Operations Center Environment
 
 SOC-Env is an OpenEnv-compliant reinforcement learning environment that simulates a Security Operations Center (SOC) monitoring an organization's device fleet. An AI agent acts as an autonomous SOC analyst — it polls telemetry, triages anomalies, investigates suspicious devices, and executes remediation actions.
