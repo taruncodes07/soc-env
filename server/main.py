@@ -8,11 +8,17 @@ app = FastAPI(title="SOC-Env", description="OpenEnv compliant SOC environment", 
 
 env_instance = Environment()
 
+from fastapi.responses import RedirectResponse
+
 class StepResponse(BaseModel):
     observation: Observation
     reward: Dict[str, Any]
     done: bool
     info: Dict[str, Any]
+
+@app.get("/", include_in_schema=False)
+def read_root():
+    return RedirectResponse(url="/docs")
 
 @app.post("/reset", response_model=Observation)
 def reset(task: str = Query("task_1", description="The task ID to load")):
