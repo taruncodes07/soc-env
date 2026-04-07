@@ -1,1 +1,9 @@
 .env
+__pycache__/
+*.pyc
+*.log
+test_*.py
+*_results*.txt
+inference_debug.log
+server.log
+uvicorn.log
