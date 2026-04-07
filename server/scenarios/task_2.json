@@ -1,0 +1,156 @@
+{
+  "scenario_id": "task_2",
+  "description": "Multi-Device Triage",
+  "max_steps": 15,
+  "devices": [
+    {
+      "device_id": "device_001",
+      "hostname": "WORKSTATION-01",
+      "os": "Windows 11",
+      "role": "workstation",
+      "logged_in_user": "user1",
+      "baseline": {
+        "cpu_percent": 10.0,
+        "memory_percent": 30.0,
+        "disk_percent": 20.0,
+        "active_processes": ["explorer.exe", "msedge.exe"],
+        "network": {
+          "bytes_in_mb": 1.0,
+          "bytes_out_mb": 0.5,
+          "active_connections": 5,
+          "destination_ports": [443],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["microsoft.com"]
+      }
+    },
+    {
+      "device_id": "device_002",
+      "hostname": "WORKSTATION-02",
+      "os": "Windows 11",
+      "role": "workstation",
+      "logged_in_user": "user2",
+      "baseline": {
+        "cpu_percent": 85.0,
+        "memory_percent": 75.0,
+        "disk_percent": 50.0,
+        "active_processes": ["explorer.exe", "chrome.exe", "video_editor.exe"],
+        "network": {
+          "bytes_in_mb": 500.0,
+          "bytes_out_mb": 20.0,
+          "active_connections": 20,
+          "destination_ports": [443, 80],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["youtube.com"]
+      }
+    },
+    {
+      "device_id": "device_003",
+      "hostname": "SERVER-DB-1",
+      "os": "Ubuntu 22.04",
+      "role": "server",
+      "logged_in_user": "root",
+      "baseline": {
+        "cpu_percent": 90.0,
+        "memory_percent": 95.0,
+        "disk_percent": 85.0,
+        "active_processes": ["postgres", "backup_script.sh"],
+        "network": {
+          "bytes_in_mb": 1000.0,
+          "bytes_out_mb": 2000.0,
+          "active_connections": 300,
+          "destination_ports": [5432],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 1,
+        "dns_queries": []
+      }
+    },
+    {
+      "device_id": "device_004",
+      "hostname": "WORKSTATION-04",
+      "os": "Windows 11",
+      "role": "workstation",
+      "logged_in_user": "user4",
+      "baseline": {
+        "cpu_percent": 15.0,
+        "memory_percent": 35.0,
+        "disk_percent": 25.0,
+        "active_processes": ["explorer.exe", "outlook.exe"],
+        "network": {
+          "bytes_in_mb": 5.0,
+          "bytes_out_mb": 2.0,
+          "active_connections": 4,
+          "destination_ports": [443],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["office365.com"]
+      },
+      "anomaly_overlay": {
+        "cpu_percent": 95.0,
+        "active_processes": ["explorer.exe", "outlook.exe", "svch0st.exe"],
+        "network": {
+          "bytes_out_mb": 150.0,
+          "destination_ports": [443, 8080],
+          "flagged_ips": ["192.168.100.5"]
+        },
+        "dns_queries": ["office365.com", "c2-server.evil.com"]
+      }
+    },
+    {
+      "device_id": "device_005",
+      "hostname": "SERVER-WEB-1",
+      "os": "Ubuntu 22.04",
+      "role": "server",
+      "logged_in_user": "root",
+      "baseline": {
+        "cpu_percent": 80.0,
+        "memory_percent": 60.0,
+        "disk_percent": 40.0,
+        "active_processes": ["nginx", "php-fpm"],
+        "network": {
+          "bytes_in_mb": 600.0,
+          "bytes_out_mb": 5000.0,
+          "active_connections": 1200,
+          "destination_ports": [443, 80],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": []
+      }
+    },
+    {
+      "device_id": "device_006",
+      "hostname": "WORKSTATION-06",
+      "os": "Windows 11",
+      "role": "workstation",
+      "logged_in_user": "user6",
+      "baseline": {
+        "cpu_percent": 5.0,
+        "memory_percent": 20.0,
+        "disk_percent": 15.0,
+        "active_processes": ["explorer.exe"],
+        "network": {
+          "bytes_in_mb": 0.1,
+          "bytes_out_mb": 0.1,
+          "active_connections": 1,
+          "destination_ports": [443],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["windowsupdate.com"]
+      }
+    }
+  ],
+  "ground_truth": {
+    "compromised_device": "device_004",
+    "anomaly_type": "malware_process",
+    "correct_remediation_actions": ["kill_process", "isolate_device"],
+    "optimal_steps": 6,
+    "escalate_required": true
+  }
+}

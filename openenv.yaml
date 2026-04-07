@@ -1,0 +1,19 @@
+name: soc-env
+version: 1.0.0
+description: >
+  A Security Operations Center environment where an AI agent monitors
+  organization-wide device telemetry, detects anomalies, and executes
+  remediation actions.
+tasks:
+  - id: task_1
+    name: Single Device Anomaly
+    difficulty: easy
+  - id: task_2
+    name: Multi-Device Triage
+    difficulty: medium
+  - id: task_3
+    name: Correlated Multi-Stage Attack
+    difficulty: hard
+action_space: structured_json
+observation_space: structured_json
+reward_range: [0.0, 1.0]
