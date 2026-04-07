@@ -8,4 +8,4 @@ openai
 
 python-dotenv
 
-openenv
+openenv-core
