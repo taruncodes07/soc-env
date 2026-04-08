@@ -8,7 +8,8 @@ from openai import OpenAI
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
+HF_TOKEN = os.getenv("HF_TOKEN")  # fallback to testing key
+API_KEY = os.getenv("OPENAI_API_KEY") or HF_TOKEN
 SOC_ENV_URL = os.getenv("SOC_ENV_URL", "http://localhost:7860")
 BENCHMARK = "soc-env"
 
@@ -22,30 +23,41 @@ def debug_log(msg: str):
         pass
 
 SYSTEM_PROMPT = textwrap.dedent("""
-    You are an AI SOC analyst. You monitor an organization's device fleet for security anomalies.
+    You are an AI SOC analyst. Your goal: identify compromised devices, remediate, and escalate all incidents.
 
-    Each step you receive either:
-    1. An org-wide snapshot showing all devices with high-level status
-    2. A detailed telemetry report for a specific device you investigated
+    MANDATORY DECISION TREE — follow every step in order:
+    1. POLL (only at start or after a major action): Use the org-wide snapshot to spot suspicious devices
+       (look for alert_flags: flagged_ips, unusual_outbound, high_cpu combined with outbound).
+    2. INVESTIGATE: Call investigate_device on the most suspicious device you haven't investigated yet.
+       Check progress.investigated_devices to avoid re-investigating.
+    3. REVIEW telemetry in your head: Look at active_processes, outbound_ips, dns_queries.
+       - Suspicious process names, unknown outbound IPs, or malicious dns domains = compromised.
+       - No suspicious indicators = call mark_safe and move to next device.
+    4. REMEDIATE if compromised (pick the right action based on evidence):
+       - kill_process  → if there is a suspicious/unknown process running
+       - block_ip      → if there is a suspicious IP in outbound_ips
+       - isolate_device → if the device is severely compromised and you want to cut it off
+    5. ESCALATE ← THIS IS MANDATORY after EVERY remediation. ALWAYS call escalate immediately after
+       any kill_process / block_ip / isolate_device. Without escalate the episode never ends.
+       Pick anomaly_type: data_exfiltration | malware_process | brute_force_login | suspicious_url_click | port_scan | resource_abuse
+    6. LOOP: Check progress.escalated_devices. If other suspicious devices remain, go back to step 2.
+       If all suspicious devices are escalated or marked safe, you are done.
 
-    You must respond with ONLY a valid JSON action object. No prose, no markdown, no explanation outside the JSON.
+    RULES:
+    - NEVER poll_org more than once without a substantive action in between (wastes steps, lowers score).
+    - NEVER investigate a device already in progress.investigated_devices unless you have new evidence.
+    - ALWAYS escalate after remediating. The last_action_result will tell you the exact next step.
+    - Read progress carefully every step — it shows exactly where you are in the workflow.
 
-    Valid actions:
-    - {"action": "poll_org"} — refresh the org-wide snapshot
-    - {"action": "investigate_device", "target_device": "<id>"} — get full telemetry for a device
-    - {"action": "isolate_device", "target_device": "<id>"} — cut device from network (irreversible)
-    - {"action": "block_ip", "target_device": "<id>", "target_ip": "<ip>"} — block an IP on a device
-    - {"action": "kill_process", "target_device": "<id>", "target_process": "<name>"} — terminate process
-    - {"action": "escalate", "target_device": "<id>", "anomaly_type": "<type>", "confidence": 0.0-1.0} — formal incident report
-    - {"action": "mark_safe", "target_device": "<id>"} — declare device clean
-
-    Anomaly types: data_exfiltration | malware_process | brute_force_login | suspicious_url_click | port_scan | resource_abuse
-
-    Rules:
-    - Only take destructive actions (isolate, kill, block) if you have evidence from investigating the device
-    - Always escalate after remediating a compromised device
-    - Be efficient — unnecessary steps reduce your score
-    - Include optional "reasoning" field to explain your decision
+    Valid actions (respond with ONLY valid JSON, no prose, no markdown):
+    {"action": "poll_org"}
+    {"action": "investigate_device", "target_device": "<id>"}
+    {"action": "isolate_device", "target_device": "<id>"}
+    {"action": "block_ip", "target_device": "<id>", "target_ip": "<ip>"}
+    {"action": "kill_process", "target_device": "<id>", "target_process": "<name>"}
+    {"action": "escalate", "target_device": "<id>", "anomaly_type": "<type>", "confidence": 0.0-1.0}
+    {"action": "mark_safe", "target_device": "<id>"}
+    Optionally add "reasoning": "..." to explain your decision.
 """).strip()
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -72,7 +84,7 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             obs = json.loads(resp.read().decode("utf-8"))
         debug_log(f"Initial Observation: {json.dumps(obs, indent=2)}")
     except Exception as e:
-        print(f"Failed to reset environment: {e}")
+        debug_log(f"Failed to reset environment: {e}")
         log_end(success=False, steps=0, score=0.00, rewards=[])
         return
 
@@ -92,9 +104,17 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             history_block = "PAST ACTIONS YOU TOOK IN THIS EPISODE:\n" + "\n".join(action_log) + "\n\n"
             
         # To save tokens, we only send the instructions, a lean action history, and current state!
+        progress = obs.get("progress") or {}
+        progress_block = (
+            f"EPISODE PROGRESS (use this to decide your next action):\n"
+            f"  Step: {progress.get('step_number', '?')}/{progress.get('max_steps', '?')} | "
+            f"Investigated: {progress.get('investigated_devices', [])} | "
+            f"Escalated: {progress.get('escalated_devices', [])} | "
+            f"Marked Safe: {progress.get('marked_safe_devices', [])}\n\n"
+        )
         messages = [{
             "role": "user", 
-            "content": f"INSTRUCTIONS:\n{SYSTEM_PROMPT}\n\n{history_block}CURRENT STATE:\n{prompt_content}"
+            "content": f"INSTRUCTIONS:\n{SYSTEM_PROMPT}\n\n{progress_block}{history_block}CURRENT STATE:\n{prompt_content}"
         }]
         
         try:
@@ -146,7 +166,7 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             obs = step_data.get("observation", {})
             reward = step_data.get("reward", {}).get("step_reward", 0.0)
             final_score = step_data.get("reward", {}).get("final_score")
-            done = step_data.get("done", True)
+            done = step_data.get("done", False)
             
             error_msg = None
             if status_code >= 400:

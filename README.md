@@ -83,7 +83,7 @@ Agents submit JSON actions. Valid actions:
 ## 6. Setup Instructions
 
 1. `pip install -r requirements.txt`
-2. `python -m uvicorn server.main:app --host 0.0.0.0 --port 7860`
+2. `python -m uvicorn server.app:app --host 0.0.0.0 --port 7860`
 3. Run the baseline agent: `python inference.py` (ensure `API_BASE_URL` and `MODEL_NAME` and `HF_TOKEN` are set).
 
 Alternatively via Docker:

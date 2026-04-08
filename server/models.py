@@ -42,11 +42,19 @@ class DeviceTelemetry(BaseModel):
     last_seen: str
     step_number: int
 
+class EpisodeProgress(BaseModel):
+    step_number: int
+    max_steps: int
+    investigated_devices: List[str]
+    escalated_devices: List[str]
+    marked_safe_devices: List[str]
+
 class Observation(BaseModel):
     data: Union[OrgSnapshot, DeviceTelemetry]
     last_action_result: str
     available_actions: List[str]
     episode_done: bool
+    progress: Optional[EpisodeProgress] = None
 
 class Action(BaseModel):
     action: Literal[

@@ -9,16 +9,19 @@ class TaskGrader:
 
         if action.action == "isolate_device":
             if action.target_device in state.ground_truth.healthy_devices:
-                step_reward -= 0.15
+                # FP penalty tracked in state.false_positive_penalty for final_score only;
+                # do NOT also subtract from step_reward to avoid double-counting.
                 state.false_positive_penalty -= 0.15
         elif action.action == "kill_process":
             if action.target_device in state.ground_truth.healthy_devices:
-                step_reward -= 0.10
                 state.false_positive_penalty -= 0.10
         elif action.action == "block_ip":
             if action.target_device in state.ground_truth.healthy_devices:
-                step_reward -= 0.05
                 state.false_positive_penalty -= 0.05
+        elif action.action == "mark_safe":
+            if action.target_device in state.ground_truth.healthy_devices:
+                # Reward agent for correctly clearing a healthy device
+                step_reward += 0.05
         
         # Step penalty
         if state.step_number > state.ground_truth.optimal_steps:

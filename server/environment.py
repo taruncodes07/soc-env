@@ -1,6 +1,7 @@
 from typing import Tuple, Dict, Any, Optional
 from server.models import (
-    EpisodeState, Action, Observation, OrgSnapshot, DeviceSummary, Reward, ActionRecord
+    EpisodeState, Action, Observation, OrgSnapshot, DeviceSummary, Reward, ActionRecord,
+    EpisodeProgress
 )
 from server.scenario_loader import load_scenario
 from server.grader import TaskGrader
@@ -10,6 +11,15 @@ class Environment:
     def __init__(self):
         self.state: Optional[EpisodeState] = None
         self.grader: Optional[TaskGrader] = None
+
+    def _build_progress(self) -> EpisodeProgress:
+        return EpisodeProgress(
+            step_number=self.state.step_number,
+            max_steps=self.state.max_steps,
+            investigated_devices=list(self.state.investigated_devices),
+            escalated_devices=list(self.state.escalated_devices),
+            marked_safe_devices=list(self.state.marked_safe_devices),
+        )
 
     def reset(self, task_id: str) -> Observation:
         self.state = load_scenario(task_id)
@@ -62,7 +72,8 @@ class Environment:
             data=snap,
             last_action_result=last_result,
             available_actions=["poll_org", "investigate_device", "isolate_device", "block_ip", "kill_process", "escalate", "mark_safe"],
-            episode_done=self.state.done
+            episode_done=self.state.done,
+            progress=self._build_progress()
         )
 
     def step(self, action: Action) -> Tuple[Observation, Reward, bool, Dict[str, Any]]:
@@ -91,13 +102,14 @@ class Environment:
                 if action.action == "investigate_device":
                     if dev_id not in self.state.investigated_devices:
                         self.state.investigated_devices.append(dev_id)
-                    result_msg = f"Investigated device {dev_id}."
+                    result_msg = f"Investigated {dev_id}. Analyze telemetry: check active_processes, outbound_ips, dns_queries. If compromised: remediate then ESCALATE. If clean: call mark_safe."
                     obs_data = dev_state.telemetry
                     step_reward_val = self.grader.score_step(action, self.state)
                 
                 elif action.action == "isolate_device":
                     dev_state.is_isolated = True
-                    result_msg = f"Isolated device {dev_id} from network."
+                    obs_data = dev_state.telemetry
+                    result_msg = f"Device {dev_id} isolated from network. NEXT: Call escalate on {dev_id} with the correct anomaly_type to formally close this incident."
                     step_reward_val = self.grader.score_step(action, self.state)
                     
                 elif action.action == "block_ip":
@@ -105,7 +117,8 @@ class Environment:
                     if ip:
                         if ip not in dev_state.blocked_ips:
                             dev_state.blocked_ips.append(ip)
-                        result_msg = f"Blocked IP {ip} on device {dev_id}."
+                        obs_data = dev_state.telemetry
+                        result_msg = f"Blocked IP {ip} on {dev_id}. NEXT: If remediation is complete, call escalate on {dev_id} with the correct anomaly_type."
                     else:
                         result_msg = "Error: Missing target_ip."
                         step_reward_val -= 0.02
@@ -116,7 +129,8 @@ class Environment:
                     if proc:
                         if proc not in dev_state.killed_processes:
                             dev_state.killed_processes.append(proc)
-                        result_msg = f"Killed process {proc} on device {dev_id}."
+                        obs_data = dev_state.telemetry
+                        result_msg = f"Killed process '{proc}' on {dev_id}. NEXT: Call escalate on {dev_id} with the correct anomaly_type to formally close this incident."
                     else:
                         result_msg = "Error: Missing target_process."
                         step_reward_val -= 0.02
@@ -144,7 +158,7 @@ class Environment:
                                 
                         self.state.identification_score += id_reward
                     
-                    result_msg = f"Escalated investigation for device {dev_id}."
+                    result_msg = f"Incident escalated for {dev_id} (anomaly: {action.anomaly_type}). Check progress — if other devices need investigation, continue. Otherwise mark remaining devices safe."
                     step_reward_val += self.grader.score_step(action, self.state)
                     
                 elif action.action == "mark_safe":
@@ -187,7 +201,8 @@ class Environment:
                 data=obs_data,
                 last_action_result=result_msg,
                 available_actions=["poll_org", "investigate_device", "isolate_device", "block_ip", "kill_process", "escalate", "mark_safe"],
-                episode_done=self.state.done
+                episode_done=self.state.done,
+                progress=self._build_progress()
             )
             
         return obs, reward, is_done, {}

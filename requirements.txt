@@ -4,3 +4,4 @@ pydantic>=2.0
 openai
 python-dotenv
 requests
+openenv-core>=0.2.0

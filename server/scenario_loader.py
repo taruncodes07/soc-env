@@ -95,7 +95,7 @@ def load_scenario(task_id: str) -> EpisodeState:
             logged_in_user=item["logged_in_user"],
             failed_login_attempts=merged.get("failed_login_attempts", 0),
             dns_queries=merged.get("dns_queries", []),
-            outbound_ips=[],
+            outbound_ips=network_data.get("flagged_ips", []),
             last_seen=datetime.utcnow().isoformat() + "Z",
             step_number=0
         )
