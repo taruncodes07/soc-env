@@ -13,8 +13,12 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic>=2.0",
     "openai",
-    "python-dotenv"
+    "python-dotenv",
+    "openenv-core>=0.2.0"
 ]
+
+[project.scripts]
+server = "server.app:start"
 
 [project.optional-dependencies]
 dev = [
