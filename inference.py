@@ -81,23 +81,14 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
     step = 0
     rewards = []
     done = False
-    action_log = []
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     
     while not done and step < max_steps:
         step += 1
         debug_log(f"\n--- Step {step} ---")
         
-        prompt_content = json.dumps(obs)
-        
-        history_block = ""
-        if action_log:
-            history_block = "PAST ACTIONS YOU TOOK IN THIS EPISODE:\n" + "\n".join(action_log) + "\n\n"
-            
-        # To save tokens, we only send the instructions, a lean action history, and current state!
-        messages = [{
-            "role": "user", 
-            "content": f"INSTRUCTIONS:\n{SYSTEM_PROMPT}\n\n{history_block}CURRENT STATE:\n{prompt_content}"
-        }]
+        obs_json = json.dumps(obs)
+        messages.append({"role": "user", "content": obs_json})
         
         try:
             debug_log(f"Calling LLM ({MODEL_NAME})...")
@@ -126,11 +117,15 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             action_dict = json.loads(action_text)
             action_str = action_dict.get("action", "unknown")
             
+            # Record assistant response in history
+            messages.append({"role": "assistant", "content": action_text})
+            
         except Exception as e:
             debug_log(f"Exception during LLM call or JSON parsing: {str(e)}")
             action_text = '{"action": "poll_org"}'
             action_str = "invalid_format"
             action_dict = {"action": "poll_org"} # fallback
+            messages.append({"role": "assistant", "content": action_text})
             
         try:
             step_resp = requests.post(f"{SOC_ENV_URL}/step", json=action_dict)
@@ -147,8 +142,6 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             elif "Error" in obs.get("last_action_result", ""):
                 error_msg = obs["last_action_result"]
                 
-            result_str = obs.get("last_action_result", "")
-            action_log.append(f"Step {step}: You output {action_text} -> Result was: {result_str}")
             
             rewards.append(reward)
             log_step(step, action_str, reward, done, error_msg)
