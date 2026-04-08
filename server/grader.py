@@ -98,8 +98,8 @@ class TaskGrader:
         
         final_score = state.identification_score + state.remediation_score + state.efficiency_score + state.false_positive_penalty
         
-        # Clamp between 0.0 and 1.0
-        final_score = max(0.0, min(1.0, final_score))
+        # Clamp strictly between 0.01 and 0.99 to meet OpenEnv strict bounds
+        final_score = max(0.01, min(0.99, final_score))
         state.final_score = final_score
         
         return Reward(
