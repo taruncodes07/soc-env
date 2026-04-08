@@ -1,16 +1,14 @@
 import os
 import json
-import requests
+import urllib.request
+import urllib.error
 import textwrap
 from typing import Optional
 from openai import OpenAI
-from dotenv import load_dotenv
-
-load_dotenv()
 
 API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY", "")
 SOC_ENV_URL = os.getenv("SOC_ENV_URL", "http://localhost:7860")
 BENCHMARK = "soc-env"
 
@@ -69,9 +67,9 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
     
     try:
         debug_log(f"Resetting environment for {task_name}...")
-        resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}")
-        resp.raise_for_status()
-        obs = resp.json()
+        req = urllib.request.Request(f"{SOC_ENV_URL}/reset?task={task_name}", method="POST")
+        with urllib.request.urlopen(req) as resp:
+            obs = json.loads(resp.read().decode("utf-8"))
         debug_log(f"Initial Observation: {json.dumps(obs, indent=2)}")
     except Exception as e:
         print(f"Failed to reset environment: {e}")
@@ -133,16 +131,25 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             action_dict = {"action": "poll_org"} # fallback
             
         try:
-            step_resp = requests.post(f"{SOC_ENV_URL}/step", json=action_dict)
-            step_resp.raise_for_status()
-            step_data = step_resp.json()
-            obs = step_data["observation"]
-            reward = step_data["reward"]["step_reward"]
-            final_score = step_data["reward"].get("final_score")
-            done = step_data["done"]
+            req = urllib.request.Request(f"{SOC_ENV_URL}/step", method="POST")
+            req.add_header("Content-Type", "application/json")
+            data = json.dumps(action_dict).encode("utf-8")
+            
+            try:
+                with urllib.request.urlopen(req, data=data) as resp:
+                    step_data = json.loads(resp.read().decode("utf-8"))
+                    status_code = resp.status
+            except urllib.error.HTTPError as e:
+                step_data = json.loads(e.read().decode("utf-8"))
+                status_code = e.code
+
+            obs = step_data.get("observation", {})
+            reward = step_data.get("reward", {}).get("step_reward", 0.0)
+            final_score = step_data.get("reward", {}).get("final_score")
+            done = step_data.get("done", True)
             
             error_msg = None
-            if step_resp.status_code >= 400:
+            if status_code >= 400:
                 error_msg = step_data.get("detail", "Error")
             elif "Error" in obs.get("last_action_result", ""):
                 error_msg = obs["last_action_result"]
@@ -153,7 +160,7 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
             rewards.append(reward)
             log_step(step, action_str, reward, done, error_msg)
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             rewards.append(0.0)
             log_step(step, action_str, 0.0, done=True, error=str(e))
             done = True
@@ -161,8 +168,10 @@ def run_task(client: OpenAI, task_name: str, max_steps: int):
 
     if final_score is None:
         try:
-            state_resp = requests.get(f"{SOC_ENV_URL}/state")
-            final_score = state_resp.json().get("final_score", 0.0)
+            req = urllib.request.Request(f"{SOC_ENV_URL}/state", method="GET")
+            with urllib.request.urlopen(req) as resp:
+                state_data = json.loads(resp.read().decode("utf-8"))
+            final_score = state_data.get("final_score", 0.0)
         except:
             final_score = 0.0
             
