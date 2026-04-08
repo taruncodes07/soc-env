@@ -202,7 +202,9 @@ docker run -p 7860:7860 soc-env
 
 ## 9. Baseline Expected Scores
 
-Target expectations for a frontier open-weights model like `Qwen/Qwen2.5-72B-Instruct`:
-- **task_1:** 0.75 - 0.90
-- **task_2:** 0.50 - 0.70
-- **task_3:** 0.25 - 0.50
+Target expectations for models like `Qwen/Qwen2.5-72B-Instruct`:
+- **task_1:** 0.90
+- **task_2:** 0.08
+- **task_3:** 0.56
+
+*Note: Although task 3 is architecturally more complex than task 2, frontier models currently struggle with task 2's specific multi-device triage due to inherent design flaws in consistent JSON formatting and state tracking.*
