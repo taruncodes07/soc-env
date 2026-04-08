@@ -14,7 +14,8 @@ dependencies = [
     "pydantic>=2.0",
     "openai",
     "python-dotenv",
-    "openenv-core>=0.2.0"
+    "openenv-core>=0.2.0",
+    "requests"
 ]
 
 [project.scripts]

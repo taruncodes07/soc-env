@@ -2507,6 +2507,7 @@ dependencies = [
     { name = "openenv-core" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "requests" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -2523,6 +2524,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "python-dotenv" },
+    { name = "requests" },
     { name = "uvicorn", extras = ["standard"] },
 ]
 provides-extras = ["dev"]
