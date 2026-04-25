@@ -103,24 +103,33 @@ def train():
         prompt_list = get_curriculum_prompts(tier=tier, count=50) # Reduced count for faster "mastery" testing
         dataset = Dataset.from_dict({"prompt": prompt_list})
         
-        training_args = GRPOConfig(
-            output_dir=f"{OUTPUT_DIR}_tier{tier}",
-            learning_rate=5e-5,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=4,
-            max_prompt_length=512,
-            max_completion_length=128,
-            num_generations=4, # Group size 4 to fit in 6GB
-            logging_steps=10,
-            max_steps=100, # Per tier
-        )
+        # Dynamic argument discovery to handle TRL's frequent API changes
+        config_kwargs = {
+            "output_dir": f"{OUTPUT_DIR}_tier{tier}",
+            "learning_rate": 5e-5,
+            "per_device_train_batch_size": 1,
+            "gradient_accumulation_steps": 4,
+            "num_generations": 4,
+            "logging_steps": 10,
+            "max_steps": 100,
+        }
         
-        trainer = GRPOTrainer(
-            model=model,
-            reward_funcs=[soc_reward_func],
-            args=training_args,
-            train_dataset=dataset,
-        )
+        trainer_kwargs = {
+            "model": model,
+            "reward_funcs": [soc_reward_func],
+            "train_dataset": dataset,
+        }
+
+        # Try to put lengths in Config first (Standard)
+        try:
+            training_args = GRPOConfig(**config_kwargs, max_prompt_length=512, max_completion_length=128)
+        except TypeError:
+            # If it fails, put them in Trainer (New API)
+            training_args = GRPOConfig(**config_kwargs)
+            trainer_kwargs["max_prompt_length"] = 512
+            trainer_kwargs["max_completion_length"] = 128
+            
+        trainer = GRPOTrainer(**trainer_kwargs, args=training_args)
         
         trainer.train()
         print(f"Tier {tier} complete. Saving checkpoint...")
