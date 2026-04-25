@@ -4,6 +4,7 @@ import requests
 import json
 import time
 import random
+import inspect
 from trl import GRPOTrainer, GRPOConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -37,11 +38,9 @@ def soc_reward_func(prompts, completions, seed, **kwargs):
     Calls the SOC-Env server with a deterministic seed to evaluate completions.
     """
     rewards = []
-    # Note: TRL passes the column data ('seed' in our case) as a list matching 'completions'
     for i, content in enumerate(completions):
         try:
             current_seed = seed[i]
-            # Reset environment with the EXACT same seed that generated the prompt
             requests.post(f"{SOC_ENV_URL}/reset?task=task_1&seed={current_seed}")
             
             # Extract JSON action
@@ -77,12 +76,15 @@ def get_curriculum_dataset(tier=1, count=50):
     print(f"Sampling {count} states for {task_name}...")
     for _ in range(count):
         s = random.randint(0, 1000000)
-        resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}&seed={s}")
-        obs = resp.json()
-        
-        prompt = f"SYSTEM: You are a SOC Analyst. Task: {task_name}. Identify compromise and remediate.\nSTATE: {json.dumps(obs['data'])}\nACTION (JSON): "
-        data["prompt"].append(prompt)
-        data["seed"].append(s)
+        try:
+            resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}&seed={s}", timeout=5)
+            obs = resp.json()
+            prompt = f"SYSTEM: You are a SOC Analyst. Task: {task_name}. Identify compromise and remediate.\nSTATE: {json.dumps(obs['data'])}\nACTION (JSON): "
+            data["prompt"].append(prompt)
+            data["seed"].append(s)
+        except Exception as e:
+            print(f"Sampling Error: {e}")
+            continue
     
     return Dataset.from_dict(data)
 
@@ -91,7 +93,7 @@ def train():
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left" # Standard for generations
+    tokenizer.padding_side = "left"
     
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -102,31 +104,45 @@ def train():
     model = get_peft_model(model, LORA_CONFIG)
     
     # Curriculum Training
-    for tier in [1, 2]: # Start with first two tiers for safety
+    for tier in [1, 2]:
         print(f"\n🚀 STARTING TIER {tier} TRAINING")
         dataset = get_curriculum_dataset(tier=tier, count=50)
         
-        training_args = GRPOConfig(
-            output_dir=f"{OUTPUT_DIR}_tier{tier}",
-            learning_rate=2e-5,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=8,
-            num_generations=4,
-            max_prompt_length=768,
-            max_completion_length=128,
-            max_steps=100,
-            logging_steps=5,
-            bf16=False, # Use fp16 for 3050
-            fp16=True,
-            report_to="none"
-        )
+        # BULLETPROOF ARGUMENT ROUTING
+        # Handles TRL version drift once and for all.
+        config_params = {
+            "output_dir": f"{OUTPUT_DIR}_tier{tier}",
+            "learning_rate": 2e-5,
+            "per_device_train_batch_size": 1,
+            "gradient_accumulation_steps": 8,
+            "num_generations": 4,
+            "max_steps": 100,
+            "logging_steps": 5,
+            "fp16": True,
+            "report_to": "none"
+        }
         
-        trainer = GRPOTrainer(
-            model=model,
-            reward_funcs=[soc_reward_func],
-            args=training_args,
-            train_dataset=dataset,
-        )
+        lengths = {"max_prompt_length": 768, "max_completion_length": 128}
+        
+        # Check if GRPOConfig accepts the length arguments
+        config_sig = inspect.signature(GRPOConfig.__init__).parameters
+        trainer_sig = inspect.signature(GRPOTrainer.__init__).parameters
+        
+        final_config_args = config_params.copy()
+        final_trainer_args = {
+            "model": model,
+            "reward_funcs": [soc_reward_func],
+            "train_dataset": dataset,
+        }
+        
+        for k, v in lengths.items():
+            if k in config_sig:
+                final_config_args[k] = v
+            elif k in trainer_sig:
+                final_trainer_args[k] = v
+        
+        training_args = GRPOConfig(**final_config_args)
+        trainer = GRPOTrainer(**final_trainer_args, args=training_args)
         
         trainer.train()
         model.save_pretrained(f"{OUTPUT_DIR}_final_tier{tier}")
