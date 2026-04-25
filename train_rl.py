@@ -4,22 +4,32 @@ import requests
 import json
 import time
 import random
-import inspect
 import re
-from trl import GRPOTrainer, GRPOConfig
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import Dataset
 
-# --- CONFIGURATION (OPTIMIZED FOR RTX 3050 6GB/COLAB T4) ---
+# --- CONFIGURATION (STABLE CORE - NO TRL DEPENDENCIES) ---
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct" 
 OUTPUT_DIR = "./soc_master_model"
 SOC_ENV_URL = "http://localhost:7860"
 
-# RTX 3050 Memory Optimizations
+# Hyperparameters
+LR = 2e-5
+BATCH_SIZE = 1           # Prompts per batch
+NUM_GENERATIONS = 4      # Completions per prompt (Group Size)
+MAX_STEPS = 100
+GRAD_ACCUM = 4
+MAX_PROMPT_LEN = 1024
+MAX_NEW_TOKENS = 128
+
+# Quantization
 BNB_CONFIG = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16, # Force Float16 to avoid BF16 AMP issues
+    bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_use_double_quant=True,
 )
@@ -33,132 +43,134 @@ LORA_CONFIG = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
-# --- REWARD FUNCTIONS ---
-def soc_reward_func(prompts, completions, seed, **kwargs):
-    """
-    Calls the SOC-Env server with a deterministic seed to evaluate completions.
-    """
-    rewards = []
-    for i, content in enumerate(completions):
+# --- CORE LOGIC: REWARD & ENVIRONMENT ---
+def get_reward(prompt, completion, seed):
+    """Parses JSON from completion and gets reward from environment."""
+    try:
+        # Reset with seed
+        requests.post(f"{SOC_ENV_URL}/reset?task=task_1&seed={seed}", timeout=5)
+        
+        # Robust JSON extraction
+        match = re.search(r'(\{.*\})', completion, re.DOTALL)
+        if not match: return 0.0
+        
+        action_json = match.group(1)
         try:
-            current_seed = seed[i]
-            requests.post(f"{SOC_ENV_URL}/reset?task=task_1&seed={current_seed}")
-            
-            # IMPROVED JSON EXTRACTION: Find the outermost valid brace pair
-            match = re.search(r'(\{.*\})', content, re.DOTALL)
-            if not match:
-                rewards.append(0.0)
-                continue
-                
-            action_json = match.group(1)
-            # Handle potential extra characters if the greedy match captures too much
-            try:
-                action_data = json.loads(action_json)
-            except json.JSONDecodeError:
-                # Fallback: try to find the start and end manually
-                start = action_json.find('{')
-                end = action_json.rfind('}') + 1
-                action_data = json.loads(action_json[start:end])
+            action_data = json.loads(action_json)
+        except json.JSONDecodeError:
+            start = action_json.find('{')
+            end = action_json.rfind('}') + 1
+            action_data = json.loads(action_json[start:end])
 
-            resp = requests.post(
-                f"{SOC_ENV_URL}/step", 
-                json=action_data,
-                timeout=5
-            )
-            data = resp.json()
-            r = data.get("reward", {}).get("step_reward", 0.0)
-            rewards.append(float(r))
-        except Exception as e:
-            # Silently handle parsing errors to keep training moving
-            rewards.append(0.0)
-    return rewards
+        resp = requests.post(f"{SOC_ENV_URL}/step", json=action_data, timeout=5)
+        return float(resp.json().get("reward", {}).get("step_reward", 0.0))
+    except Exception:
+        return 0.0
 
-# --- CURRICULUM DATA GENERATOR ---
-def get_curriculum_dataset(tier=1, count=50):
-    """
-    Generates a dataset of (prompt, seed) pairs.
-    """
-    data = {"prompt": [], "seed": []}
-    tasks = ["task_1", "task_2", "task_3", "task_4"]
+# --- DATASET GENERATOR ---
+def get_curriculum_data(tier=1, count=50):
+    data = []
+    tasks = [f"task_{i}" for i in range(1, 5)]
     task_name = tasks[tier-1]
-    
     print(f"Sampling {count} states for {task_name}...")
     for _ in range(count):
-        s = random.randint(0, 1000000)
+        seed = random.randint(0, 1000000)
         try:
-            resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}&seed={s}", timeout=5)
+            resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}&seed={seed}", timeout=5)
             obs = resp.json()
-            # Explicit formatting to help the model learn the structure
             prompt = f"SYSTEM: You are a SOC Analyst. Task: {task_name}. Identify compromise and remediate.\nSTATE: {json.dumps(obs['data'])}\nACTION (JSON): "
-            data["prompt"].append(prompt)
-            data["seed"].append(s)
-        except Exception as e:
-            continue
-    
-    return Dataset.from_dict(data)
+            data.append({"prompt": prompt, "seed": seed})
+        except: continue
+    return data
 
+# --- CUSTOM GRPO TRAINING LOOP ---
 def train():
-    print("Initializing SOC-Env Master Training (Mixed Precision Optimized)...")
+    print(f"Initializing Custom GRPO Loop for {MODEL_ID}...")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=BNB_CONFIG,
         device_map="auto",
-        torch_dtype=torch.float16 # Ensure weights stay out of BF16
+        torch_dtype=torch.float16
     )
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LORA_CONFIG)
+    model.train()
+
+    optimizer = AdamW(model.parameters(), lr=LR)
     
-    # Curriculum Training
     for tier in [1, 2]:
         print(f"\n🚀 STARTING TIER {tier} TRAINING")
-        dataset = get_curriculum_dataset(tier=tier, count=50)
+        dataset = get_curriculum_data(tier=tier, count=50)
         
-        # BULLETPROOF CONFIG
-        config_params = {
-            "output_dir": f"{OUTPUT_DIR}_tier{tier}",
-            "learning_rate": 2e-5,
-            "per_device_train_batch_size": 1,
-            "gradient_accumulation_steps": 8,
-            "num_generations": 4,
-            "max_steps": 100,
-            "logging_steps": 5,
-            "fp16": True,
-            "bf16": False, # EXPLICITLY DISABLE BF16 to avoid AMP GradScaler issues
-            "report_to": "none"
-        }
+        pbar = tqdm(range(MAX_STEPS))
+        step = 0
+        optimizer.zero_grad()
         
-        lengths = {"max_prompt_length": 1024, "max_completion_length": 128}
-        
-        config_sig = inspect.signature(GRPOConfig.__init__).parameters
-        trainer_sig = inspect.signature(GRPOTrainer.__init__).parameters
-        
-        final_config_args = config_params.copy()
-        final_trainer_args = {
-            "model": model,
-            "reward_funcs": [soc_reward_func],
-            "train_dataset": dataset,
-        }
-        
-        for k, v in lengths.items():
-            if k in config_sig:
-                final_config_args[k] = v
-            elif k in trainer_sig:
-                final_trainer_args[k] = v
-        
-        training_args = GRPOConfig(**final_config_args)
-        trainer = GRPOTrainer(**final_trainer_args, args=training_args)
-        
-        # Disable automatic BF16 detection if enabled by default in some versions
-        if hasattr(trainer.args, 'bf16'):
-            trainer.args.bf16 = False
-        
-        trainer.train()
+        for i in pbar:
+            sample = random.choice(dataset)
+            prompt = sample["prompt"]
+            seed = sample["seed"]
+            
+            # 1. GENERATE GROUP
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=MAX_PROMPT_LEN).to("cuda")
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    num_return_sequences=NUM_GENERATIONS,
+                    do_sample=True,
+                    temperature=0.8,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            
+            # 2. EVALUATE REWARDS
+            completions = [tokenizer.decode(out[inputs.input_ids.shape[1]:], skip_special_tokens=True) for out in outputs]
+            rewards = torch.tensor([get_reward(prompt, c, seed) for c in completions], device="cuda")
+            
+            # 3. COMPUTE GRPO ADVANTAGES
+            mean_r = rewards.mean()
+            std_r = rewards.std() + 1e-8
+            advantages = (rewards - mean_r) / std_r
+            
+            # 4. COMPUTE LOG PROBS & LOSS
+            # Extract only the completion parts for log-prob calculation
+            all_tokens = outputs # [GroupSize, FullSeqLen]
+            prompt_len = inputs.input_ids.shape[1]
+            
+            logits = model(all_tokens).logits[:, prompt_len-1:-1, :] # Shift for causal alignment
+            labels = all_tokens[:, prompt_len:].contiguous()
+            
+            log_probs = torch.log_softmax(logits, dim=-1)
+            target_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+            
+            # Mask padding
+            mask = (labels != tokenizer.pad_token_id).float()
+            per_token_log_probs = target_log_probs * mask
+            sentence_log_probs = per_token_log_probs.sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            
+            # GRPO Objective: Mean over generations of (advantage * log_prob)
+            loss = -(sentence_log_probs * advantages).mean()
+            loss = loss / GRAD_ACCUM
+            
+            loss.backward()
+            
+            if (step + 1) % GRAD_ACCUM == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            step += 1
+            pbar.set_description(f"Loss: {loss.item()*GRAD_ACCUM:.4f} | R_mean: {mean_r:.2f}")
+
         model.save_pretrained(f"{OUTPUT_DIR}_final_tier{tier}")
+    
+    print("Training Complete!")
 
 if __name__ == "__main__":
     train()
