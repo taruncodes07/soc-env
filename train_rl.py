@@ -108,6 +108,8 @@ def train():
             learning_rate=5e-5,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=4,
+            max_prompt_length=512,
+            max_completion_length=128,
             num_generations=4, # Group size 4 to fit in 6GB
             logging_steps=10,
             max_steps=100, # Per tier
@@ -118,8 +120,6 @@ def train():
             reward_funcs=[soc_reward_func],
             args=training_args,
             train_dataset=dataset,
-            max_prompt_length=512,
-            max_completion_length=128,
         )
         
         trainer.train()
