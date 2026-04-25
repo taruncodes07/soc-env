@@ -150,26 +150,32 @@ def train():
         advantages = (rewards - mean_r) / std_r
         
         # 4. TRAINING UPDATE (Gradients ON)
-        # We process the group in one forward pass
-        # To avoid checkpointing issues, we use the input_ids directly
-        # Since we aren't using checkpointing, gradients will just work.
+        # We process the group sequentially (mini-batch size 1) to avoid CUDA OOM 
+        # on consumer GPUs like Colab T4 (15GB) or RTX 3050 (6GB).
+        has_gradients = advantages.abs().sum() > 0
         
-        logits = model(outputs).logits[:, inputs.input_ids.shape[1]-1:-1, :]
-        labels = outputs[:, inputs.input_ids.shape[1]:].contiguous()
-        
-        log_probs = torch.log_softmax(logits, dim=-1)
-        # Gather log probs for the actual tokens produced
-        per_token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
-        
-        # Mask padding tokens
-        mask = (labels != tokenizer.pad_token_id).float()
-        loss_vector = -(per_token_log_probs * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-        
-        # Weighted loss by advantages
-        group_loss = (loss_vector * advantages).mean() / GRAD_ACCUM
-        
-        if not torch.isnan(group_loss) and advantages.abs().sum() > 0:
-            group_loss.backward()
+        if has_gradients:
+            for i in range(GROUP_SIZE):
+                single_output = outputs[i:i+1] # Shape: (1, seq_len)
+                single_adv = advantages[i]
+                
+                logits = model(single_output).logits[:, inputs.input_ids.shape[1]-1:-1, :]
+                labels = single_output[:, inputs.input_ids.shape[1]:].contiguous()
+                
+                log_probs = torch.log_softmax(logits, dim=-1)
+                per_token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+                
+                mask = (labels != tokenizer.pad_token_id).float()
+                loss_vector = -(per_token_log_probs * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+                
+                # We calculate the mean over the group size incrementally
+                single_loss = (loss_vector * single_adv).sum() / (GROUP_SIZE * GRAD_ACCUM)
+                
+                if not torch.isnan(single_loss):
+                    single_loss.backward()
+                    
+                # Explicitly free intermediate tensors to keep VRAM usage perfectly flat
+                del logits, log_probs, per_token_log_probs, labels, mask, loss_vector, single_loss
         
         if (step + 1) % GRAD_ACCUM == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
