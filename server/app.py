@@ -47,9 +47,13 @@ def get_metrics():
 @app.post("/reset", response_model=Observation)
 def reset(
     task: str = Query("task_1", description="The task ID to load"),
-    randomize: bool = Query(True, description="Whether to randomize the scenario")
+    randomize: bool = Query(True, description="Whether to randomize the scenario"),
+    seed: Optional[int] = Query(None, description="Random seed for deterministic reset")
 ):
     try:
+        if seed is not None:
+            import random
+            random.seed(seed)
         obs = env_instance.reset(task, randomize=randomize)
         return obs
     except ValueError as e:

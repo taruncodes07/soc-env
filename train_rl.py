@@ -3,13 +3,14 @@ import torch
 import requests
 import json
 import time
+import random
 from trl import GRPOTrainer, GRPOConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import Dataset
 
 # --- CONFIGURATION (OPTIMIZED FOR RTX 3050 6GB) ---
-MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct" # Using a smaller model to ensure group stability on 6GB
+MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"  # Smaller model for 6GB VRAM
 OUTPUT_DIR = "./soc_master_model"
 SOC_ENV_URL = "http://localhost:7860"
 
@@ -31,20 +32,19 @@ LORA_CONFIG = LoraConfig(
 )
 
 # --- REWARD FUNCTIONS ---
-def soc_reward_func(prompts, completions, **kwargs):
+def soc_reward_func(prompts, completions, seed, **kwargs):
     """
-    Calls the SOC-Env server to get rewards for the generated actions.
+    Calls the SOC-Env server with a deterministic seed to evaluate completions.
     """
     rewards = []
-    # We strip the thought process if the model uses <thought>...
+    # Note: TRL passes the column data ('seed' in our case) as a list matching 'completions'
     for i, content in enumerate(completions):
         try:
-            # We assume a single turn for GRPO rollout
-            # Reset env for this specific sample (using sample index as seed if needed)
-            requests.post(f"{SOC_ENV_URL}/reset?task=task_1")
+            current_seed = seed[i]
+            # Reset environment with the EXACT same seed that generated the prompt
+            requests.post(f"{SOC_ENV_URL}/reset?task=task_1&seed={current_seed}")
             
-            # Try to parse JSON from the completion
-            # Simple heuristic: find the first { and last }
+            # Extract JSON action
             start = content.find('{')
             end = content.rfind('}') + 1
             if start == -1 or end == 0:
@@ -58,35 +58,40 @@ def soc_reward_func(prompts, completions, **kwargs):
                 timeout=5
             )
             data = resp.json()
-            # Reward is based on step_reward + meta_reward logic in server
             r = data.get("reward", {}).get("step_reward", 0.0)
             rewards.append(float(r))
-        except Exception:
+        except Exception as e:
+            print(f"Reward Error: {e}")
             rewards.append(0.0)
     return rewards
 
 # --- CURRICULUM DATA GENERATOR ---
-def get_curriculum_prompts(tier=1, count=100):
+def get_curriculum_dataset(tier=1, count=50):
     """
-    Generates a list of prompt strings from the randomized environment.
+    Generates a dataset of (prompt, seed) pairs.
     """
-    prompts = []
+    data = {"prompt": [], "seed": []}
     tasks = ["task_1", "task_2", "task_3", "task_4"]
     task_name = tasks[tier-1]
     
+    print(f"Sampling {count} states for {task_name}...")
     for _ in range(count):
-        resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}")
+        s = random.randint(0, 1000000)
+        resp = requests.post(f"{SOC_ENV_URL}/reset?task={task_name}&seed={s}")
         obs = resp.json()
-        # Construct the minimal prompt for the model
-        prompt = f"INSTRUCTIONS: Identify compromise and remediate. State: {json.dumps(obs['data'])}"
-        prompts.append(prompt)
-    return prompts
+        
+        prompt = f"SYSTEM: You are a SOC Analyst. Task: {task_name}. Identify compromise and remediate.\nSTATE: {json.dumps(obs['data'])}\nACTION (JSON): "
+        data["prompt"].append(prompt)
+        data["seed"].append(s)
+    
+    return Dataset.from_dict(data)
 
 def train():
-    print("Initializing Master Model Training for RTX 3050...")
+    print("Initializing SOC-Env Master Training (RTX 3050 Optimized)...")
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left" # Standard for generations
     
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
@@ -96,45 +101,35 @@ def train():
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LORA_CONFIG)
     
-    # Curriculum Loop
-    for tier in [1, 2, 3, 4]:
-        print(f"\n--- STARTING TIER {tier} TRAINING ---")
+    # Curriculum Training
+    for tier in [1, 2]: # Start with first two tiers for safety
+        print(f"\n🚀 STARTING TIER {tier} TRAINING")
+        dataset = get_curriculum_dataset(tier=tier, count=50)
         
-        prompt_list = get_curriculum_prompts(tier=tier, count=50) # Reduced count for faster "mastery" testing
-        dataset = Dataset.from_dict({"prompt": prompt_list})
+        training_args = GRPOConfig(
+            output_dir=f"{OUTPUT_DIR}_tier{tier}",
+            learning_rate=2e-5,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
+            num_generations=4,
+            max_prompt_length=768,
+            max_completion_length=128,
+            max_steps=100,
+            logging_steps=5,
+            bf16=False, # Use fp16 for 3050
+            fp16=True,
+            report_to="none"
+        )
         
-        # Dynamic argument discovery to handle TRL's frequent API changes
-        config_kwargs = {
-            "output_dir": f"{OUTPUT_DIR}_tier{tier}",
-            "learning_rate": 5e-5,
-            "per_device_train_batch_size": 1,
-            "gradient_accumulation_steps": 4,
-            "num_generations": 4,
-            "logging_steps": 10,
-            "max_steps": 100,
-        }
-        
-        trainer_kwargs = {
-            "model": model,
-            "reward_funcs": [soc_reward_func],
-            "train_dataset": dataset,
-        }
-
-        # Try to put lengths in Config first (Standard)
-        try:
-            training_args = GRPOConfig(**config_kwargs, max_prompt_length=512, max_completion_length=128)
-        except TypeError:
-            # If it fails, put them in Trainer (New API)
-            training_args = GRPOConfig(**config_kwargs)
-            trainer_kwargs["max_prompt_length"] = 512
-            trainer_kwargs["max_completion_length"] = 128
-            
-        trainer = GRPOTrainer(**trainer_kwargs, args=training_args)
+        trainer = GRPOTrainer(
+            model=model,
+            reward_funcs=[soc_reward_func],
+            args=training_args,
+            train_dataset=dataset,
+        )
         
         trainer.train()
-        print(f"Tier {tier} complete. Saving checkpoint...")
-        model.save_pretrained(f"{OUTPUT_DIR}_final")
+        model.save_pretrained(f"{OUTPUT_DIR}_final_tier{tier}")
 
 if __name__ == "__main__":
-    # Ensure server is running in another terminal
     train()

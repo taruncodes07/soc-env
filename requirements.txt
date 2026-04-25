@@ -5,3 +5,11 @@ openai
 python-dotenv
 requests
 openenv-core>=0.2.0
+torch
+transformers
+trl
+peft
+bitsandbytes
+datasets
+accelerate
+sentencepiece
