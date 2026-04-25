@@ -197,6 +197,50 @@
         "failed_login_attempts": 0,
         "dns_queries": []
       }
+    },
+    {
+      "device_id": "device_101",
+      "hostname": "BACKUP-SERVER-1",
+      "os": "Ubuntu 22.04",
+      "role": "server",
+      "logged_in_user": "backup_admin",
+      "baseline": {
+        "cpu_percent": 88.0,
+        "memory_percent": 40.0,
+        "disk_percent": 90.0,
+        "active_processes": ["cron", "rsync", "tar"],
+        "network": {
+          "bytes_in_mb": 10.0,
+          "bytes_out_mb": 5.0,
+          "active_connections": 5,
+          "destination_ports": [22],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["internal.backup.local"]
+      }
+    },
+    {
+      "device_id": "device_102",
+      "hostname": "MEDIA-SERVER",
+      "os": "Windows Server 2022",
+      "role": "server",
+      "logged_in_user": "media_svc",
+      "baseline": {
+        "cpu_percent": 15.0,
+        "memory_percent": 30.0,
+        "disk_percent": 60.0,
+        "active_processes": ["nginx", "streaming_service.exe"],
+        "network": {
+          "bytes_in_mb": 5.0,
+          "bytes_out_mb": 200.0,
+          "active_connections": 100,
+          "destination_ports": [443, 80],
+          "flagged_ips": []
+        },
+        "failed_login_attempts": 0,
+        "dns_queries": ["cdn.whitelisted.com"]
+      }
     }
   ],
   "ground_truth": {

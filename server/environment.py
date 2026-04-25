@@ -11,6 +11,7 @@ class Environment:
     def __init__(self):
         self.state: Optional[EpisodeState] = None
         self.grader: Optional[TaskGrader] = None
+        self.steps_since_compromise_detected: Optional[int] = None
 
     def _build_progress(self) -> EpisodeProgress:
         return EpisodeProgress(
@@ -21,9 +22,10 @@ class Environment:
             marked_safe_devices=list(self.state.marked_safe_devices),
         )
 
-    def reset(self, task_id: str) -> Observation:
-        self.state = load_scenario(task_id)
+    def reset(self, task_id: str, randomize: bool = True) -> Observation:
+        self.state = load_scenario(task_id, randomize=randomize)
         self.grader = TaskGrader(self.state.ground_truth)
+        self.steps_since_compromise_detected = None
         
         return self._get_org_snapshot("Episode started.")
 
@@ -44,6 +46,8 @@ class Environment:
                 flags.append("login_failures")
             if len(dt.network.flagged_ips) > 0:
                 flags.append("flagged_ips")
+            if getattr(dev_state, "lateral_moved", False):
+                flags.append("lateral_movement_detected")
                 
             if len(flags) >= 2 or dt.cpu_percent > 90.0:
                 status = "critical"
@@ -105,6 +109,10 @@ class Environment:
                     result_msg = f"Investigated {dev_id}. Analyze telemetry: check active_processes, outbound_ips, dns_queries. If compromised: remediate then ESCALATE. If clean: call mark_safe."
                     obs_data = dev_state.telemetry
                     step_reward_val = self.grader.score_step(action, self.state)
+                    
+                    if dev_id in self.state.ground_truth.compromised_devices:
+                        if self.steps_since_compromise_detected is None:
+                            self.steps_since_compromise_detected = 0
                 
                 elif action.action == "isolate_device":
                     dev_state.is_isolated = True
@@ -172,6 +180,31 @@ class Environment:
             step_reward_val = -0.02
             
         self.state.actions_taken.append(ActionRecord(step=self.state.step_number, action=action, result=result_msg))
+        
+        # Lateral movement check
+        if getattr(self, "steps_since_compromise_detected", None) is not None:
+            unmitigated = False
+            for d_id in self.state.investigated_devices:
+                if d_id in self.state.ground_truth.compromised_devices:
+                    d_state = self.state.devices.get(d_id)
+                    if d_state and not d_state.is_isolated and len(d_state.blocked_ips) == 0:
+                        unmitigated = True
+            
+            if unmitigated:
+                self.steps_since_compromise_detected += 1
+                if self.steps_since_compromise_detected == 6:
+                    import random
+                    healthy = [d for d in self.state.devices.keys() if d not in self.state.ground_truth.compromised_devices]
+                    if healthy:
+                        target = random.choice(healthy)
+                        self.state.ground_truth.compromised_devices.append(target)
+                        if target in self.state.ground_truth.healthy_devices:
+                            self.state.ground_truth.healthy_devices.remove(target)
+                        self.state.devices[target].is_compromised = True
+                        setattr(self.state.devices[target], "lateral_moved", True)
+                        step_reward_val -= 0.10
+                        result_msg += f" [WARNING: Lateral movement detected to {target}]"
+                        
         self.state.last_action_result = result_msg
         self.state.cumulative_reward += step_reward_val
         

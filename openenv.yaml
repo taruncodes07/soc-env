@@ -1,5 +1,5 @@
 name: soc-env
-version: 1.0.0
+version: 1.1.0
 description: >
   A Security Operations Center environment where an AI agent monitors
   organization-wide device telemetry, detects anomalies, and executes
@@ -14,6 +14,13 @@ tasks:
   - id: task_3
     name: Correlated Multi-Stage Attack
     difficulty: hard
-action_space: structured_json
-observation_space: structured_json
-reward_range: [0.0, 1.0]
+  - id: task_4
+    name: Lateral Movement & Honey-pot Triage
+    difficulty: hard
+action_space:
+  type: structured_json
+  schema_ref: server/models.py:Action
+observation_space:
+  type: structured_json
+  schema_ref: server/models.py:Observation
+reward_range: [0.01, 0.99]
