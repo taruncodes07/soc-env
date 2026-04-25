@@ -62,7 +62,8 @@ class Environment:
                 memory_percent=dt.memory_percent,
                 bytes_out_mb=dt.network.bytes_out_mb,
                 active_connections=dt.network.active_connections,
-                alert_flags=flags
+                alert_flags=flags,
+                criticality=dt.criticality
             )
             device_summaries.append(summary)
             

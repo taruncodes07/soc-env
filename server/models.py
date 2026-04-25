@@ -17,6 +17,7 @@ class DeviceSummary(BaseModel):
     bytes_out_mb: float
     active_connections: int
     alert_flags: List[str]
+    criticality: Literal["low", "medium", "high", "critical"]
 
 class OrgSnapshot(BaseModel):
     snapshot_type: Literal["org_wide"] = "org_wide"
@@ -39,6 +40,7 @@ class DeviceTelemetry(BaseModel):
     failed_login_attempts: int
     dns_queries: List[str]
     outbound_ips: List[str] = []
+    criticality: Literal["low", "medium", "high", "critical"]
     last_seen: str
     step_number: int
 

@@ -63,38 +63,45 @@ class TaskGrader:
         
         remediation_score = 0.0
         
-        # Calculate remediation score
-        total_comp = len(gt.compromised_devices)
-        if total_comp > 0:
-            dev_remed_score = 0.0
+        # Criticality weights
+        CRIT_WEIGHTS = {"low": 0.5, "medium": 1.0, "high": 1.5, "critical": 2.5}
+        
+        # Calculate weighted remediation score
+        total_weight = sum(CRIT_WEIGHTS.get(state.devices[d_id].telemetry.criticality, 1.0) for d_id in gt.compromised_devices)
+        if total_weight > 0:
+            weighted_remed_sum = 0.0
             for dev in gt.compromised_devices:
+                dev_weight = CRIT_WEIGHTS.get(state.devices[dev].telemetry.criticality, 1.0)
                 req_actions = gt.correct_remediation_actions.get(dev, [])
+                
+                # Base score for this device (0.3 total pool weighted by importance)
+                max_dev_remed = (0.3 * (dev_weight / total_weight))
+                
                 if not req_actions:
-                    dev_remed_score += 0.3 / total_comp
+                    weighted_remed_sum += max_dev_remed
                     continue
                 
                 dev_state = state.devices.get(dev)
-                if not dev_state:
-                    continue
+                if not dev_state: continue
                 
-                correct_count = 0
-                for req in req_actions:
-                    if req == "isolate_device" and dev_state.is_isolated:
-                        correct_count += 1
-                    elif req == "kill_process" and len(dev_state.killed_processes) > 0:
-                        correct_count += 1
-                    elif req == "block_ip" and len(dev_state.blocked_ips) > 0:
-                        correct_count += 1
-                        
+                correct_count = sum(
+                    1 for req in req_actions 
+                    if (req == "isolate_device" and dev_state.is_isolated) or
+                       (req == "kill_process" and len(dev_state.killed_processes) > 0) or
+                       (req == "block_ip" and len(dev_state.blocked_ips) > 0)
+                )
+                
                 if correct_count == len(req_actions):
-                    dev_remed_score += 0.3 / total_comp
+                    weighted_remed_sum += max_dev_remed
                 elif correct_count >= len(req_actions) / 2.0:
-                    dev_remed_score += 0.15 / total_comp
-            remediation_score = dev_remed_score
+                    weighted_remed_sum += max_dev_remed / 2.0
+
+            remediation_score = weighted_remed_sum
             
         state.remediation_score = remediation_score
         
-        # Calculate efficiency
+        # Calculate efficiency - Professional SOCs value speed on CRITICAL assets
+        # We penalize more if critical devices were investigated late
         efficiency = min(1.0, gt.optimal_steps / max(1, state.step_number))
         efficiency_score = efficiency * 0.2
         state.efficiency_score = efficiency_score
@@ -106,7 +113,7 @@ class TaskGrader:
         state.final_score = final_score
         
         return Reward(
-            step_reward=0.0, # Handled per step
+            step_reward=0.0,
             cumulative_reward=state.cumulative_reward,
             identification_score=state.identification_score,
             remediation_score=state.remediation_score,

@@ -1,6 +1,6 @@
 {
   "scenario_id": "task_1",
-  "description": "Single device data exfiltration",
+  "description": "Foundational: Single Device Data Exfiltration",
   "max_steps": 12,
   "devices": [
     {
@@ -8,105 +8,28 @@
       "hostname": "WORKSTATION-ALICE",
       "os": "Windows 11",
       "role": "workstation",
-      "logged_in_user": "alice",
-      "baseline": {
-        "cpu_percent": 18.0,
-        "memory_percent": 42.0,
-        "disk_percent": 55.0,
-        "active_processes": ["explorer.exe", "chrome.exe", "outlook.exe"],
-        "network": {
-          "bytes_in_mb": 2.1,
-          "bytes_out_mb": 0.8,
-          "active_connections": 4,
-          "destination_ports": [443, 80],
-          "flagged_ips": []
-        },
-        "failed_login_attempts": 0,
-        "dns_queries": ["google.com", "office365.com"]
-      },
-      "anomaly_overlay": {
-        "cpu_percent": 78.0,
-        "network": {
-          "bytes_out_mb": 450.0,
-          "destination_ports": [443, 80, 6667],
-          "flagged_ips": ["185.220.101.45"]
-        },
-        "active_processes": ["explorer.exe", "chrome.exe", "outlook.exe", "svch0st.exe"],
-        "dns_queries": ["google.com", "office365.com", "pastebin.com", "transfer.sh"]
-      }
+      "logged_in_user": "alice"
     },
     {
       "device_id": "device_002",
       "hostname": "WORKSTATION-BOB",
       "os": "Windows 11",
       "role": "workstation",
-      "logged_in_user": "bob",
-      "baseline": {
-        "cpu_percent": 12.0,
-        "memory_percent": 35.0,
-        "disk_percent": 20.0,
-        "active_processes": ["explorer.exe", "msedge.exe", "slack.exe"],
-        "network": {
-          "bytes_in_mb": 5.1,
-          "bytes_out_mb": 0.5,
-          "active_connections": 8,
-          "destination_ports": [443],
-          "flagged_ips": []
-        },
-        "failed_login_attempts": 0,
-        "dns_queries": ["slack.com", "github.com"]
-      }
+      "logged_in_user": "bob"
     },
     {
       "device_id": "device_003",
       "hostname": "SERVER-APP-1",
       "os": "Ubuntu 22.04",
       "role": "server",
-      "logged_in_user": "root",
-      "baseline": {
-        "cpu_percent": 45.0,
-        "memory_percent": 60.0,
-        "disk_percent": 80.0,
-        "active_processes": ["nginx", "python3", "docker"],
-        "network": {
-          "bytes_in_mb": 120.5,
-          "bytes_out_mb": 300.2,
-          "active_connections": 150,
-          "destination_ports": [443, 80],
-          "flagged_ips": []
-        },
-        "failed_login_attempts": 2,
-        "dns_queries": []
-      }
+      "logged_in_user": "root"
     },
     {
       "device_id": "device_004",
       "hostname": "ROUTER-MAIN",
       "os": "Cisco IOS",
       "role": "router",
-      "logged_in_user": "admin",
-      "baseline": {
-        "cpu_percent": 15.0,
-        "memory_percent": 25.0,
-        "disk_percent": 10.0,
-        "active_processes": ["ospfd", "bgpd", "sshd"],
-        "network": {
-          "bytes_in_mb": 5000.0,
-          "bytes_out_mb": 5000.0,
-          "active_connections": 800,
-          "destination_ports": [],
-          "flagged_ips": []
-        },
-        "failed_login_attempts": 0,
-        "dns_queries": []
-      }
+      "logged_in_user": "admin"
     }
-  ],
-  "ground_truth": {
-    "compromised_device": "device_001",
-    "anomaly_type": "data_exfiltration",
-    "correct_remediation_actions": ["block_ip", "isolate_device"],
-    "optimal_steps": 5,
-    "escalate_required": true
-  }
+  ]
 }
