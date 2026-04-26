@@ -1,483 +1,185 @@
 """
-SOC-Env: High-Performance Custom GRPO RL Training
-—————————————————————————————————————————————
-• OpenEnv-compliant via soc_openenv.SOCEnvironment
-• NO trl.GRPOTrainer (fragile, breaks constantly)
-• NO HTTP server dependency (environment called natively)
-• Curriculum: Task 1 → Task 4 with progressive unlocking
-• Rich multi-signal reward: format + environment step + episode final
-• TensorBoard + Matplotlib reward curves saved every checkpoint
-• RTX 3050 (6GB) safe: FP16, 4-bit quant, sequential micro-batches
+🚀 SOC-Env: Native Master Trainer (Zero-Dependency GRPO)
+—————————————————————————————————————————————————————
+• Scrap Blackboxes: No trl.GRPOTrainer, No Unsloth.
+• 100% Stable: Uses standard transformers + peft + bitsandbytes.
+• OpenEnv: Inherits and uses the native environment logic.
+• VRAM Optimized: Fits in 6GB (Laptop) and T4 (Colab).
+• Features: Curriculum, Multi-signal Reward, Real-time Graphs.
 """
 
 import os, json, random, re, time, warnings
 import torch
-import matplotlib
-matplotlib.use("Agg")  # Non-interactive backend (works on Colab/headless)
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model
-
-# TensorBoard (built into PyTorch — no extra install)
 from torch.utils.tensorboard import SummaryWriter
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    BitsAndBytesConfig
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from soc_openenv import make_env
 
-# OpenEnv-compliant environment wrapper
-from soc_openenv import SOCEnvironment, make_env
-from server.models import Action
+warnings.filterwarnings("ignore")
 
-warnings.filterwarnings("ignore", message=".*torch_dtype.*")
-warnings.filterwarnings("ignore", message=".*BitsAndBytes.*")
-
-# ─────────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────────────
-# Qwen2.5-3B is 2x smarter than 1.5B, still fits in 6GB at 4-bit.
-# On Colab T4/A100 you can bump this to "Qwen/Qwen2.5-7B-Instruct".
-MODEL_ID   = "Qwen/Qwen2.5-3B-Instruct"
-OUTPUT_DIR = "./soc_rl_trained"
+# ── CONFIGURATION ────────────────────────────────────────────────────────
+MODEL_ID   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
+OUTPUT_DIR = "./soc_rl_stable_final"
 GRAPH_DIR  = "./training_graphs"
+MAX_STEPS  = 120   # total optimizer steps
+NUM_GENS   = 4     # responses per state (GRPO group size)
+LR         = 2e-5
+os.makedirs(GRAPH_DIR, exist_ok=True)
 
-LR          = 2e-5     # Higher LR: format already learned from Phase 1
-GROUP_SIZE  = 4        # 4 completions per prompt — safe for 6GB VRAM
-GRAD_ACCUM  = 4        # Effective batch = GROUP_SIZE * GRAD_ACCUM = 16
-MAX_STEPS   = 150      # 150 optimizer steps → 600 inner generations
-SAVE_EVERY  = 50       # Save model + graph every N optimizer steps
-MAX_PROMPT_LEN = 700
-MAX_NEW_TOKENS = 180
-
-# Curriculum progression (tasks unlocked as steps advance)
-CURRICULUM = {
-    0:   ["task_1"],
-    30:  ["task_1", "task_2"],
-    70:  ["task_1", "task_2", "task_3"],
-    110: ["task_1", "task_2", "task_3", "task_4"],
-}
-
-# ─────────────────────────────────────────────────────────────────
-# MODEL SETUP
-# ─────────────────────────────────────────────────────────────────
-BNB_CONFIG = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True,
-)
-
-LORA_CONFIG = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj", "k_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-
-# ─────────────────────────────────────────────────────────────────
-# NATIVE ENVIRONMENT HELPERS
-# ─────────────────────────────────────────────────────────────────
-def run_full_episode_reward(action_data: dict, task_id: str) -> float:
-    """
-    Runs a short, guided episode to get a rich reward signal.
-    First step = model's action. Remaining steps = greedy optimal play
-    so the episode actually terminates and produces a final_score.
-    Returns a reward in [0, 1].
-    Uses the OpenEnv-compliant SOCEnvironment wrapper.
-    """
-    env = make_env(task_id=task_id, randomize=True)   # OpenEnv factory
-    try:
-        env.reset()
-    except Exception:
-        return 0.0
-
-    # Step 1: Execute the model's proposed action (dict accepted by SOCEnvironment)
-    try:
-        obs, scalar_reward, done, info = env.step(action_data)
-        step_reward = scalar_reward
-    except Exception:
-        step_reward = 0.0
-        done = False
-
-    if done:
-        return max(0.0, min(1.0, step_reward))
-
-    # Steps 2+: Greedy oracle play to drive the episode to completion
-    # and produce a meaningful final_score for RL shaping
-    gt = env._env.state.ground_truth
-    max_oracle = env._env.state.max_steps - env._env.state.step_number
-
-    state = env._env.state   # internal state for oracle play
-    for _ in range(max_oracle):
-        if state.done:
-            break
-        # Oracle strategy: investigate → remediate → escalate → mark_safe
-        acted = False
-        for dev_id in gt.compromised_devices:
-            if dev_id not in state.investigated_devices:
-                try:
-                    env.step({"action": "investigate_device", "target_device": dev_id})
-                    acted = True; break
-                except Exception: pass
-
-        if not acted:
-            for dev_id in gt.compromised_devices:
-                dev_state = state.devices.get(dev_id)
-                if dev_state and not dev_state.is_isolated:
-                    req = gt.correct_remediation_actions.get(dev_id, ["isolate_device"])
-                    for r_action in req:
-                        try:
-                            if r_action == "kill_process":
-                                proc = (dev_state.telemetry.active_processes or ["unknown_proc"])[-1]
-                                env.step({"action": "kill_process", "target_device": dev_id, "target_process": proc})
-                            elif r_action == "block_ip":
-                                ips = dev_state.telemetry.network.flagged_ips
-                                ip = ips[0] if ips else "0.0.0.0"
-                                env.step({"action": "block_ip", "target_device": dev_id, "target_ip": ip})
-                            else:
-                                env.step({"action": r_action, "target_device": dev_id})
-                            acted = True; break
-                        except Exception: pass
-                    if acted: break
-
-        if not acted:
-            for dev_id in gt.compromised_devices:
-                if dev_id not in state.escalated_devices:
-                    a_type = gt.anomaly_types.get(dev_id, "malware_process")
-                    try:
-                        env.step({"action": "escalate", "target_device": dev_id, "anomaly_type": a_type})
-                        acted = True; break
-                    except Exception: pass
-
-        if not acted:
-            for dev_id in gt.healthy_devices:
-                if dev_id not in state.marked_safe_devices:
-                    try:
-                        env.step({"action": "mark_safe", "target_device": dev_id})
-                        acted = True; break
-                    except Exception: pass
-
-        if not acted:
-            try: env.step({"action": "poll_org"})
-            except Exception: break
-
-    # Get final episode score
-    final = state.final_score
-    if final is None:
-        final = state.identification_score + state.remediation_score
-    final = max(0.0, min(1.0, float(final)))
-
-    # Blend: 30% model's first-step reward, 70% episode outcome
-    return 0.3 * max(0.0, step_reward) + 0.7 * final
-
-
-def get_reward(completion: str, task_id: str) -> float:
-    """
-    Multi-signal reward function:
-    1. Format signal  (fast, always runs)
-    2. Environment signal (native, no HTTP)
-    Returns a float reward.
-    """
+# ── REWARD LOGIC (OpenEnv Managed) ───────────────────────────────────────
+def calculate_reward(prompt, response, task_id):
+    """Zero-dependency reward calculator."""
     score = 0.0
-
-    # Signal 1: Attempted structure
-    if "action" in completion.lower() or "{" in completion:
-        score += 0.05
-
-    if "{" in completion and "}" in completion:
-        score += 0.10
-
-    # Signal 2: Valid JSON extraction
-    match = re.search(r'(\{[^{}]*\})', completion, re.DOTALL)
-    if not match:
-        return score
+    # 1. Format Signal (Fast)
+    if "{" in response and "}" in response: score += 0.1
+    match = re.search(r"(\{.*\})", response, re.DOTALL)
+    if not match: return score
 
     try:
-        action_data = json.loads(match.group(1).strip())
-    except json.JSONDecodeError:
-        return score
-
-    score += 0.20  # Valid JSON bonus
-
-    # Signal 3: Has valid action key
-    valid_actions = {
-        "poll_org", "investigate_device", "isolate_device",
-        "block_ip", "kill_process", "escalate", "mark_safe"
-    }
-    if action_data.get("action") in valid_actions:
-        score += 0.10  # Knows valid action names
-
-    # Signal 4: Has target device (shows strategic thinking)
-    if action_data.get("action") != "poll_org" and action_data.get("target_device"):
-        score += 0.10
-
-    # Signal 5: Full native environment episode score
-    try:
-        env_score = run_full_episode_reward(action_data, task_id)
-        score += env_score * 0.80  # Environment is the primary driver
-    except Exception:
+        action_data = json.loads(match.group(1))
+        score += 0.2
+        # 2. OpenEnv Signal (Depth)
+        env = make_env(task_id=task_id)
+        env.reset()
+        _, env_rew, _, _ = env.step(action_data)
+        # We value the environment's score highly
+        score += (float(env_rew) * 1.0)
+    except:
         pass
+    return min(1.5, score)
 
-    return min(score, 1.5)  # Uncapped to allow high rewards to propagate
-
-
-# ─────────────────────────────────────────────────────────────────
-# GRAPH SAVING
-# ─────────────────────────────────────────────────────────────────
-def save_reward_graph(steps_log, avg_reward_log, max_reward_log, loss_log, save_path):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-
-    axes[0].plot(steps_log, avg_reward_log, label="Avg Reward", color="#4A9EFF", linewidth=2)
-    axes[0].plot(steps_log, max_reward_log, label="Max Reward", color="#50C878",
-                 linewidth=1.5, linestyle="--", alpha=0.8)
-    axes[0].axhline(y=0.35, color="#FF6B6B", linestyle=":", linewidth=1.5,
-                    label="Phase 1 Ceiling (Format Only)")
-    axes[0].set_title("SOC-Env Agent: Reward Progress", fontsize=14, fontweight="bold")
-    axes[0].set_ylabel("Reward")
-    axes[0].set_xlabel("Optimizer Step")
-    axes[0].legend()
-    axes[0].grid(alpha=0.3)
-    axes[0].set_ylim(0, 1.6)
-
-    if loss_log:
-        axes[1].plot(steps_log, loss_log, label="GRPO Loss", color="#FF8C42", linewidth=2)
-        axes[1].set_title("Training Loss", fontsize=14, fontweight="bold")
-        axes[1].set_ylabel("Loss")
-        axes[1].set_xlabel("Optimizer Step")
-        axes[1].legend()
-        axes[1].grid(alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  📈 Graph saved → {save_path}")
-
-
-# ─────────────────────────────────────────────────────────────────
-# MAIN TRAINING LOOP
-# ─────────────────────────────────────────────────────────────────
-def get_active_tasks(optimizer_step: int) -> list:
-    """Returns curriculum task list for current step."""
-    active = ["task_1"]
-    for threshold, tasks in CURRICULUM.items():
-        if optimizer_step >= threshold:
-            active = tasks
-    return active
-
-
+# ── TRAINING LOOP ────────────────────────────────────────────────────────
 def train():
-    os.makedirs(GRAPH_DIR, exist_ok=True)
-
-    print(f"🚀  Loading {MODEL_ID} in 4-bit FP16 ...")
+    print(f"🎬 Starting Zero-Blackbox Training: {MODEL_ID}")
+    
+    # 1. Load Model (Stable 4-bit)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16
+    )
+    
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    tokenizer.pad_token  = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
+    tokenizer.pad_token = tokenizer.eos_token
+    
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        quantization_config=BNB_CONFIG,
+        quantization_config=bnb_config,
         device_map="auto",
-        torch_dtype=torch.float16,
+        trust_remote_code=True
     )
-    model = get_peft_model(model, LORA_CONFIG)
-
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            param.requires_grad = True
-
-    optimizer = AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=LR, eps=1e-8, weight_decay=0.01
+    model = prepare_model_for_kbit_training(model)
+    
+    lora_config = LoraConfig(
+        r=16, lora_alpha=32, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
     )
+    model = get_peft_model(model, lora_config)
+    model.train()
+
+    optimizer = AdamW(model.parameters(), lr=LR)
     scheduler = CosineAnnealingLR(optimizer, T_max=MAX_STEPS, eta_min=1e-6)
 
-    # TensorBoard writer
+    # TensorBoard & Logging
     tb_writer = SummaryWriter(log_dir=os.path.join(GRAPH_DIR, "tensorboard"))
-    print(f"📊  TensorBoard logs → {GRAPH_DIR}/tensorboard")
-    print(f"    Run: tensorboard --logdir {GRAPH_DIR}/tensorboard")
+    history = []
+    pbar = tqdm(range(MAX_STEPS), desc="Optimizing")
 
-    # Pre-sample starting states using OpenEnv wrapper
-    print("📂  Sampling initial states from all tasks ...")
-    training_pool = {task: [] for task in ["task_1", "task_2", "task_3", "task_4"]}
-    sample_env = make_env()   # OpenEnv factory
-    for task_id in training_pool:
-        for _ in range(25):
-            try:
-                obs = sample_env.reset(task_id=task_id, randomize=True)
-                obs_dict = json.loads(obs.model_dump_json())
-                training_pool[task_id].append({
-                    "state": json.dumps(obs_dict["data"]),
-                    "task_id": task_id,
-                })
-            except Exception:
-                continue
+    for step in pbar:
+        # 1. Curriculum Task Selection
+        if step < 20:   task_id = "task_1"
+        elif step < 50: task_id = random.choice(["task_1", "task_2"])
+        elif step < 80: task_id = random.choice(["task_1", "task_2", "task_3"])
+        else:           task_id = random.choice(["task_1", "task_2", "task_3", "task_4"])
 
-    total_tasks = sum(len(v) for v in training_pool.values())
-    print(f"✅  Loaded {total_tasks} states across {len(training_pool)} tasks.\n")
-
-    # Tracking logs for graphs
-    steps_log, avg_reward_log, max_reward_log, loss_log = [], [], [], []
-
-    inner_step  = 0
-    opt_step    = 0
-    model.train()
-    optimizer.zero_grad()
-
-    pbar = tqdm(total=MAX_STEPS, desc="Training", unit="opt-step")
-
-    while opt_step < MAX_STEPS:
-        # ── Curriculum: pick from currently unlocked tasks ──
-        active_tasks = get_active_tasks(opt_step)
-        task_id = random.choice(active_tasks)
-        pool    = training_pool.get(task_id, training_pool["task_1"])
-        if not pool:
-            continue
-        sample  = random.choice(pool)
-
-        prompt = (
-            "SYSTEM: You are a professional SOC Analyst. Given the current network state, "
-            "output exactly ONE action as a JSON object. "
-            "Valid actions: poll_org, investigate_device, isolate_device, block_ip, kill_process, escalate, mark_safe. "
-            "For device actions always include target_device. "
-            "Prioritise CRITICAL and high-criticality devices that show multiple alert flags.\n"
-            f"CURRENT STATE:\n{sample['state']}\n"
-            "RESPOND WITH JSON ONLY:\n"
-        )
-
-        inputs = tokenizer(
-            prompt, return_tensors="pt", truncation=True,
-            max_length=MAX_PROMPT_LEN, padding=False
-        ).to("cuda")
-        prompt_len = inputs.input_ids.shape[1]
-
-        # ── GENERATE (no grad) ──
-        model.eval()
+        # 2. Get Env State
+        env = make_env(task_id=task_id)
+        obs = env.reset()
+        state_str = json.dumps(json.loads(obs.model_dump_json())["data"])
+        prompt = f"SYSTEM: SOC Analyst. Reply JSON.\\nSTATE: {state_str}\\nACTION:"
+        
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        # 3. GRPO Generation (4 completions)
+        completions = []
+        rewards = []
+        
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                num_return_sequences=GROUP_SIZE,
-                do_sample=True,
-                temperature=0.85,
-                top_p=0.9,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        torch.cuda.empty_cache()
-        model.train()
-
-        # ── REWARD ──
-        completions  = [
-            tokenizer.decode(o[prompt_len:], skip_special_tokens=True)
-            for o in outputs
-        ]
-        raw_rewards  = [get_reward(c, task_id) for c in completions]
-        rewards_t    = torch.tensor(raw_rewards, device="cuda", dtype=torch.float32)
-
-        mean_r = rewards_t.mean().item()
-        max_r  = rewards_t.max().item()
-
-        # ── ADVANTAGES ──
-        std_r = rewards_t.std().item()
-        if std_r < 1e-4:
-            # Degenerate case: all same reward — use sign of mean to nudge
-            advantages = torch.full_like(rewards_t, 0.1 if mean_r > 0.1 else -0.1)
-        else:
-            advantages = (rewards_t - rewards_t.mean()) / (std_r + 1e-8)
-
-        # ── TRAINING UPDATE (sequential micro-batches) ──
-        total_loss = 0.0
-        for i in range(GROUP_SIZE):
-            single_out = outputs[i:i+1]           # (1, seq_len)
-            adv_i      = advantages[i].float()
-
-            # Cast logits to float32 for stable log_softmax
-            logits = model(single_out).logits[:, prompt_len-1:-1, :].float()
-            labels = single_out[:, prompt_len:].contiguous()
-
-            log_probs          = torch.log_softmax(logits, dim=-1)
-            per_tok_lp         = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
-            mask               = (labels != tokenizer.pad_token_id).float()
-            response_len       = mask.sum(dim=1) + 1e-8
-            mean_log_prob      = (per_tok_lp * mask).sum(dim=1) / response_len
-            # GRPO loss: negative mean log-prob scaled by advantage
-            single_loss        = -(mean_log_prob * adv_i).mean() / GRAD_ACCUM
-
-            if not torch.isnan(single_loss) and single_loss.requires_grad:
-                single_loss.backward()
-                total_loss += single_loss.item()
-
-            del logits, log_probs, per_tok_lp, labels, mask, mean_log_prob, single_loss
-            torch.cuda.empty_cache()
-
-        inner_step += 1
-
-        # ── OPTIMIZER STEP ──
-        if inner_step % GRAD_ACCUM == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            opt_step += 1
-
-            cur_lr = scheduler.get_last_lr()[0]
-
-            # ── TensorBoard logging ──
-            tb_writer.add_scalar("reward/avg",     mean_r,      opt_step)
-            tb_writer.add_scalar("reward/max",     max_r,       opt_step)
-            tb_writer.add_scalar("reward/min",     min(raw_rewards), opt_step)
-            tb_writer.add_scalar("train/loss",     total_loss,  opt_step)
-            tb_writer.add_scalar("train/lr",       cur_lr,      opt_step)
-            tb_writer.add_scalar("train/std_adv",  std_r,       opt_step)
-            tb_writer.add_text("curriculum/task",  task_id,     opt_step)
-            tb_writer.flush()
-
-            # ── In-memory log for Matplotlib ──
-            steps_log.append(opt_step)
-            avg_reward_log.append(mean_r)
-            max_reward_log.append(max_r)
-            loss_log.append(total_loss)
-
-            # Update tqdm bar
-            pbar.set_postfix({
-                "task": task_id,
-                "R_avg": f"{mean_r:.3f}",
-                "R_max": f"{max_r:.3f}",
-                "loss": f"{total_loss:.4f}",
-                "lr": f"{cur_lr:.2e}",
-            })
-            pbar.update(1)
-
-            # ── CHECKPOINT ──
-            if opt_step % SAVE_EVERY == 0 or opt_step == MAX_STEPS:
-                ckpt = f"{OUTPUT_DIR}_step{opt_step}"
-                model.save_pretrained(ckpt)
-                tokenizer.save_pretrained(ckpt)
-                print(f"\n💾  Checkpoint saved → {ckpt}")
-
-                graph_path = os.path.join(GRAPH_DIR, f"reward_curve_step{opt_step}.png")
-                save_reward_graph(
-                    steps_log, avg_reward_log, max_reward_log, loss_log, graph_path
+            for _ in range(NUM_GENS):
+                out = model.generate(
+                    **inputs, 
+                    max_new_tokens=100, 
+                    do_sample=True, 
+                    temperature=0.9,
+                    pad_token_id=tokenizer.pad_token_id
                 )
+                resp = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                completions.append(out)
+                rewards.append(calculate_reward(prompt, resp, task_id))
 
-    pbar.close()
+        # 4. Compute Advantages
+        r_mean = sum(rewards) / len(rewards)
+        r_std  = (sum((r - r_mean)**2 for r in rewards) / len(rewards))**0.5 + 1e-6
+        advantages = [(r - r_mean) / r_std for r in rewards]
+
+        # 5. Optimization Step
+        total_loss = 0
+        optimizer.zero_grad()
+        
+        for i in range(NUM_GENS):
+            outputs = model(completions[i])
+            logits  = outputs.logits[:, inputs.input_ids.shape[1]-1 : -1, :]
+            labels  = completions[i][:, inputs.input_ids.shape[1] : ]
+            
+            log_probs = F.log_softmax(logits, dim=-1)
+            target_log_probs = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+            loss = -(target_log_probs.mean() * advantages[i])
+            
+            loss.backward()
+            total_loss += loss.item()
+
+        optimizer.step()
+        scheduler.step()
+
+        # ── Requirements: Log to TensorBoard & History ──
+        mean_r = sum(rewards) / len(rewards)
+        history.append(mean_r)
+        
+        opt_loss = total_loss / NUM_GENS
+        tb_writer.add_scalar("Reward/Mean", mean_r, step)
+        tb_writer.add_scalar("Loss/Policy", opt_loss, step)
+        tb_writer.add_scalar("Curriculum/TaskIndex", ["task_1","task_2","task_3","task_4"].index(task_id), step)
+
+        pbar.set_postfix({"R": f"{mean_r:.2f}", "Loss": f"{opt_loss:.4f}", "Task": task_id})
+
+        # ── Requirements: Real-time Matplotlib Graph ──
+        if step > 0 and step % 20 == 0:
+            plt.figure(figsize=(10,5))
+            plt.plot(history, color="#2563eb", linewidth=2, label="Agent Reward")
+            plt.axhline(0.35, color="#dc2626", linestyle="--", alpha=0.6, label="Base Format Score")
+            plt.fill_between(range(len(history)), history, 0.35, where=(torch.tensor(history) > 0.35), color="#dbeafe", alpha=0.5)
+            plt.title(f"SOC-Env Progress: Step {step} ({task_id})", fontsize=12)
+            plt.xlabel("Optimizer Steps", fontsize=10)
+            plt.ylabel("Mean Episode Reward", fontsize=10)
+            plt.legend()
+            plt.grid(alpha=0.2)
+            plt.savefig(f"{GRAPH_DIR}/reward_curve.png", dpi=120)
+            plt.close()
+
+    # Final Save
     tb_writer.close()
-
-    # ── FINAL SAVE ──
-    model.save_pretrained(OUTPUT_DIR + "_final")
-    tokenizer.save_pretrained(OUTPUT_DIR + "_final")
-
-    # Final graph
-    final_graph = os.path.join(GRAPH_DIR, "reward_curve_FINAL.png")
-    save_reward_graph(steps_log, avg_reward_log, max_reward_log, loss_log, final_graph)
-
-    print(f"\n✅  Training complete!")
-    print(f"   Model  → {OUTPUT_DIR}_final")
-    print(f"   Graphs → {GRAPH_DIR}/")
-
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
 
 if __name__ == "__main__":
     train()
