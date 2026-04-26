@@ -1,11 +1,12 @@
 """
 SOC-Env: High-Performance Custom GRPO RL Training
 —————————————————————————————————————————————
+• OpenEnv-compliant via soc_openenv.SOCEnvironment
 • NO trl.GRPOTrainer (fragile, breaks constantly)
 • NO HTTP server dependency (environment called natively)
 • Curriculum: Task 1 → Task 4 with progressive unlocking
 • Rich multi-signal reward: format + environment step + episode final
-• Reward curve PNG saved every checkpoint
+• TensorBoard + Matplotlib reward curves saved every checkpoint
 • RTX 3050 (6GB) safe: FP16, 4-bit quant, sequential micro-batches
 """
 
@@ -20,8 +21,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 
-# Direct native environment imports — bypasses HTTP server entirely
-from server.environment import Environment
+# TensorBoard (built into PyTorch — no extra install)
+from torch.utils.tensorboard import SummaryWriter
+
+# OpenEnv-compliant environment wrapper
+from soc_openenv import SOCEnvironment, make_env
 from server.models import Action
 
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
@@ -81,20 +85,20 @@ def run_full_episode_reward(action_data: dict, task_id: str) -> float:
     First step = model's action. Remaining steps = greedy optimal play
     so the episode actually terminates and produces a final_score.
     Returns a reward in [0, 1].
+    Uses the OpenEnv-compliant SOCEnvironment wrapper.
     """
-    env = Environment()
+    env = make_env(task_id=task_id, randomize=True)   # OpenEnv factory
     try:
-        env.reset(task_id=task_id, randomize=True)
+        env.reset()
     except Exception:
         return 0.0
 
-    # Step 1: Execute the model's proposed action
+    # Step 1: Execute the model's proposed action (dict accepted by SOCEnvironment)
     try:
-        action_obj = Action(**action_data)
-        _, reward_obj, done, _ = env.step(action_obj)
-        step_reward = float(reward_obj.step_reward)
+        obs, scalar_reward, done, info = env.step(action_data)
+        step_reward = scalar_reward
     except Exception:
-        step_reward = -0.05
+        step_reward = 0.0
         done = False
 
     if done:
@@ -102,67 +106,67 @@ def run_full_episode_reward(action_data: dict, task_id: str) -> float:
 
     # Steps 2+: Greedy oracle play to drive the episode to completion
     # and produce a meaningful final_score for RL shaping
-    gt = env.state.ground_truth
-    max_oracle = env.state.max_steps - env.state.step_number
+    gt = env._env.state.ground_truth
+    max_oracle = env._env.state.max_steps - env._env.state.step_number
 
+    state = env._env.state   # internal state for oracle play
     for _ in range(max_oracle):
-        if env.state.done:
+        if state.done:
             break
         # Oracle strategy: investigate → remediate → escalate → mark_safe
         acted = False
         for dev_id in gt.compromised_devices:
-            if dev_id not in env.state.investigated_devices:
+            if dev_id not in state.investigated_devices:
                 try:
-                    env.step(Action(action="investigate_device", target_device=dev_id))
+                    env.step({"action": "investigate_device", "target_device": dev_id})
                     acted = True; break
                 except Exception: pass
 
         if not acted:
             for dev_id in gt.compromised_devices:
-                dev_state = env.state.devices.get(dev_id)
+                dev_state = state.devices.get(dev_id)
                 if dev_state and not dev_state.is_isolated:
-                    # Pick correct remediation action
                     req = gt.correct_remediation_actions.get(dev_id, ["isolate_device"])
                     for r_action in req:
                         try:
                             if r_action == "kill_process":
                                 proc = (dev_state.telemetry.active_processes or ["unknown_proc"])[-1]
-                                env.step(Action(action="kill_process", target_device=dev_id, target_process=proc))
+                                env.step({"action": "kill_process", "target_device": dev_id, "target_process": proc})
                             elif r_action == "block_ip":
                                 ips = dev_state.telemetry.network.flagged_ips
                                 ip = ips[0] if ips else "0.0.0.0"
-                                env.step(Action(action="block_ip", target_device=dev_id, target_ip=ip))
+                                env.step({"action": "block_ip", "target_device": dev_id, "target_ip": ip})
                             else:
-                                env.step(Action(action=r_action, target_device=dev_id))
+                                env.step({"action": r_action, "target_device": dev_id})
                             acted = True; break
                         except Exception: pass
                     if acted: break
 
         if not acted:
             for dev_id in gt.compromised_devices:
-                if dev_id not in env.state.escalated_devices:
+                if dev_id not in state.escalated_devices:
                     a_type = gt.anomaly_types.get(dev_id, "malware_process")
                     try:
-                        env.step(Action(action="escalate", target_device=dev_id, anomaly_type=a_type))
+                        env.step({"action": "escalate", "target_device": dev_id, "anomaly_type": a_type})
                         acted = True; break
                     except Exception: pass
 
         if not acted:
             for dev_id in gt.healthy_devices:
-                if dev_id not in env.state.marked_safe_devices:
+                if dev_id not in state.marked_safe_devices:
                     try:
-                        env.step(Action(action="mark_safe", target_device=dev_id))
+                        env.step({"action": "mark_safe", "target_device": dev_id})
                         acted = True; break
                     except Exception: pass
 
         if not acted:
-            try: env.step(Action(action="poll_org"))
+            try: env.step({"action": "poll_org"})
             except Exception: break
 
     # Get final episode score
-    final = env.state.final_score
+    final = state.final_score
     if final is None:
-        final = env.state.identification_score + env.state.remediation_score
+        final = state.identification_score + state.remediation_score
     final = max(0.0, min(1.0, float(final)))
 
     # Blend: 30% model's first-step reward, 70% episode outcome
@@ -290,10 +294,15 @@ def train():
     )
     scheduler = CosineAnnealingLR(optimizer, T_max=MAX_STEPS, eta_min=1e-6)
 
-    # Pre-sample starting states for all tasks natively
+    # TensorBoard writer
+    tb_writer = SummaryWriter(log_dir=os.path.join(GRAPH_DIR, "tensorboard"))
+    print(f"📊  TensorBoard logs → {GRAPH_DIR}/tensorboard")
+    print(f"    Run: tensorboard --logdir {GRAPH_DIR}/tensorboard")
+
+    # Pre-sample starting states using OpenEnv wrapper
     print("📂  Sampling initial states from all tasks ...")
     training_pool = {task: [] for task in ["task_1", "task_2", "task_3", "task_4"]}
-    sample_env = Environment()
+    sample_env = make_env()   # OpenEnv factory
     for task_id in training_pool:
         for _ in range(25):
             try:
@@ -301,7 +310,7 @@ def train():
                 obs_dict = json.loads(obs.model_dump_json())
                 training_pool[task_id].append({
                     "state": json.dumps(obs_dict["data"]),
-                    "task_id": task_id
+                    "task_id": task_id,
                 })
             except Exception:
                 continue
@@ -414,14 +423,25 @@ def train():
             optimizer.zero_grad()
             opt_step += 1
 
-            # Log
+            cur_lr = scheduler.get_last_lr()[0]
+
+            # ── TensorBoard logging ──
+            tb_writer.add_scalar("reward/avg",     mean_r,      opt_step)
+            tb_writer.add_scalar("reward/max",     max_r,       opt_step)
+            tb_writer.add_scalar("reward/min",     min(raw_rewards), opt_step)
+            tb_writer.add_scalar("train/loss",     total_loss,  opt_step)
+            tb_writer.add_scalar("train/lr",       cur_lr,      opt_step)
+            tb_writer.add_scalar("train/std_adv",  std_r,       opt_step)
+            tb_writer.add_text("curriculum/task",  task_id,     opt_step)
+            tb_writer.flush()
+
+            # ── In-memory log for Matplotlib ──
             steps_log.append(opt_step)
             avg_reward_log.append(mean_r)
             max_reward_log.append(max_r)
             loss_log.append(total_loss)
 
             # Update tqdm bar
-            cur_lr = scheduler.get_last_lr()[0]
             pbar.set_postfix({
                 "task": task_id,
                 "R_avg": f"{mean_r:.3f}",
@@ -444,6 +464,7 @@ def train():
                 )
 
     pbar.close()
+    tb_writer.close()
 
     # ── FINAL SAVE ──
     model.save_pretrained(OUTPUT_DIR + "_final")
